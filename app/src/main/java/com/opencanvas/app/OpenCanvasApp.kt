@@ -1,12 +1,15 @@
 package com.opencanvas.app
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -33,14 +36,14 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
@@ -49,6 +52,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
@@ -70,7 +74,6 @@ private val CanvasBackground = Color(0xFFFAFBF7)
 private val Surface = Color(0xFFFFFFFF)
 private val Ink = Color(0xFF17191E)
 private val Muted = Color(0xFF62666F)
-private val Accent = Color(0xFF2266E3)
 private val Brand = Color(0xFFF5C842)
 private val Border = Color(0xFFD8DAD3)
 private val Palette = listOf(0xFF17191EL, 0xFF2266E3L, 0xFF20B77AL, 0xFFFFC62EL, 0xFFFF3E55L, 0xFF8C5DE8L)
@@ -303,13 +306,11 @@ private class EditorSession(
     val items = mutableStateListOf<BoardItem>().apply { addAll(board.items) }
     private val undoStack = ArrayDeque<List<BoardItem>>()
     private val redoStack = ArrayDeque<List<BoardItem>>()
-    var selectedId by mutableStateOf<String?>(null)
     val previewPoints = mutableStateListOf<BoardPoint>()
 
     val canUndo: Boolean get() = undoStack.isNotEmpty()
     val canRedo: Boolean get() = redoStack.isNotEmpty()
     fun currentTitle() = title
-    fun selectedItem(): BoardItem? = items.firstOrNull { it.id == selectedId }
     fun snapshot(): List<BoardItem> = items.toList()
 
     fun rename(value: String) {
@@ -317,25 +318,20 @@ private class EditorSession(
         publish()
     }
 
-    fun select(id: String?) { selectedId = id }
 
     fun add(item: BoardItem) {
         checkpoint()
         items += item
-        selectedId = null
         publish()
     }
 
     fun eraseAt(point: BoardPoint) {
         val item = hitTest(items, point, 20f) ?: return
         items.remove(item)
-        if (selectedId == item.id) selectedId = null
     }
 
-    fun moveSelected(dx: Float, dy: Float) {
-        val id = selectedId ?: return
-        val index = items.indexOfFirst { it.id == id }
-        if (index >= 0) items[index] = items[index].moved(dx, dy)
+    fun restoreSnapshot(snapshot: List<BoardItem>) {
+        replaceAll(snapshot)
     }
 
     fun finishTransaction(before: List<BoardItem>) {
@@ -349,7 +345,6 @@ private class EditorSession(
         if (undoStack.isEmpty()) return
         redoStack.addLast(items.toList())
         replaceAll(undoStack.removeLast())
-        selectedId = null
         publish()
     }
 
@@ -357,7 +352,6 @@ private class EditorSession(
         if (redoStack.isEmpty()) return
         undoStack.addLast(items.toList())
         replaceAll(redoStack.removeLast())
-        selectedId = null
         publish()
     }
 
@@ -395,6 +389,7 @@ private fun BoardEditor(
             scale = scale,
             viewport = viewport,
             onViewportChange = { viewport = it },
+            onScaleChange = { scale = it },
         )
         EditorTopBar(
             title = session.currentTitle(),
@@ -484,93 +479,107 @@ private fun DrawingCanvas(
     scale: Float,
     viewport: Offset,
     onViewportChange: (Offset) -> Unit,
+    onScaleChange: (Float) -> Unit,
 ) {
+    val latestScale by rememberUpdatedState(scale)
+    val latestViewport by rememberUpdatedState(viewport)
     Canvas(
-        Modifier.fillMaxSize().pointerInput(tool, color, scale, viewport) {
+        Modifier.fillMaxSize().pointerInput(tool, color) {
             awaitEachGesture {
                 val down = awaitFirstDown(requireUnconsumed = false)
-                val startBoard = screenToBoard(down.position, viewport, scale)
-                when (tool) {
-                    CanvasTool.PEN, CanvasTool.MARKER -> {
+                var gestureScale = latestScale
+                var gestureViewport = latestViewport
+                val startBoard = screenToBoard(down.position, gestureViewport, gestureScale)
+                val eraseSnapshot = if (tool == CanvasTool.ERASER) session.snapshot() else null
+                var erased = false
+                var transforming = false
+
+                session.previewPoints.clear()
+                if (tool == CanvasTool.PEN || tool == CanvasTool.MARKER) {
+                    session.previewPoints += startBoard
+                }
+                down.consume()
+
+                var pressed = true
+                while (pressed) {
+                    val event = awaitPointerEvent(PointerEventPass.Main)
+                    val pressedCount = event.changes.count { it.pressed }
+                    val previousPressedCount = event.changes.count { it.previousPressed }
+                    val startingTransform = !transforming && pressedCount >= 2
+                    if (startingTransform) {
+                        transforming = true
                         session.previewPoints.clear()
-                        session.previewPoints += startBoard
-                        down.consume()
-                        var pressed = true
-                        while (pressed) {
-                            val event = awaitPointerEvent(PointerEventPass.Main)
-                            val change = event.changes.first()
-                            if (change.pressed) {
-                                session.previewPoints += screenToBoard(change.position, viewport, scale)
-                                change.consume()
-                            }
-                            pressed = event.changes.any { it.pressed }
+                        if (erased && eraseSnapshot != null) {
+                            session.restoreSnapshot(eraseSnapshot)
+                            erased = false
                         }
-                        if (session.previewPoints.size > 1) {
-                            session.add(
-                                BoardItem(
-                                    points = session.previewPoints.toList(),
-                                    color = color,
-                                    width = if (tool == CanvasTool.MARKER) 26f else 5.5f,
-                                    opacity = if (tool == CanvasTool.MARKER) 0.42f else 1f,
-                                ),
-                            )
-                        }
-                        session.previewPoints.clear()
                     }
-                    CanvasTool.ERASER -> {
-                        val before = session.snapshot()
-                        session.eraseAt(startBoard)
-                        var pressed = true
-                        while (pressed) {
-                            val event = awaitPointerEvent()
-                            event.changes.forEach { change ->
-                                if (change.pressed) {
-                                    session.eraseAt(screenToBoard(change.position, viewport, scale))
-                                    change.consume()
+
+                    if (transforming) {
+                        if (!startingTransform && pressedCount > 0 && pressedCount == previousPressedCount) {
+                            val previousCentroid = event.calculateCentroid(useCurrent = false)
+                            val currentCentroid = event.calculateCentroid(useCurrent = true)
+                            val zoom = event.calculateZoom()
+                            if (
+                                previousCentroid.x.isFinite() &&
+                                previousCentroid.y.isFinite() &&
+                                currentCentroid.x.isFinite() &&
+                                currentCentroid.y.isFinite() &&
+                                zoom.isFinite()
+                            ) {
+                                val newScale = (gestureScale * zoom).coerceIn(0.35f, 2.5f)
+                                val scaleChange = newScale / gestureScale
+                                gestureViewport = transformViewport(
+                                    viewport = gestureViewport,
+                                    previousCentroid = previousCentroid,
+                                    currentCentroid = currentCentroid,
+                                    scaleChange = scaleChange,
+                                )
+                                gestureScale = newScale
+                                onViewportChange(gestureViewport)
+                                onScaleChange(gestureScale)
+                            }
+                        }
+                        event.changes.forEach { it.consume() }
+                    } else {
+                        val change = event.changes.firstOrNull { it.pressed }
+                        if (change != null) {
+                            val boardPoint = screenToBoard(change.position, gestureViewport, gestureScale)
+                            when (tool) {
+                                CanvasTool.PEN, CanvasTool.MARKER -> session.previewPoints += boardPoint
+                                CanvasTool.ERASER -> {
+                                    session.eraseAt(boardPoint)
+                                    erased = true
                                 }
                             }
-                            pressed = event.changes.any { it.pressed }
+                            change.consume()
                         }
-                        session.finishTransaction(before)
                     }
-                    CanvasTool.SELECT -> {
-                        val hit = hitTest(session.items, startBoard, 18f / scale)
-                        if (hit != null) {
-                            session.select(hit.id)
-                            val before = session.snapshot()
-                            var previous = down.position
-                            var pressed = true
-                            while (pressed) {
-                                val event = awaitPointerEvent()
-                                val change = event.changes.first()
-                                if (change.pressed) {
-                                    val delta = change.position - previous
-                                    session.moveSelected(delta.x / scale, delta.y / scale)
-                                    previous = change.position
-                                    change.consume()
-                                }
-                                pressed = event.changes.any { it.pressed }
+                    pressed = pressedCount > 0
+                }
+
+                if (!transforming) {
+                    when (tool) {
+                        CanvasTool.PEN, CanvasTool.MARKER -> {
+                            if (session.previewPoints.size > 1) {
+                                session.add(
+                                    BoardItem(
+                                        points = session.previewPoints.toList(),
+                                        color = color,
+                                        width = if (tool == CanvasTool.MARKER) 26f else 5.5f,
+                                        opacity = if (tool == CanvasTool.MARKER) 0.42f else 1f,
+                                    ),
+                                )
                             }
+                        }
+                        CanvasTool.ERASER -> {
+                            val before = requireNotNull(eraseSnapshot)
+                            if (!erased) session.eraseAt(startBoard)
                             session.finishTransaction(before)
-                        } else {
-                            session.select(null)
-                            var previous = down.position
-                            var currentViewport = viewport
-                            var pressed = true
-                            while (pressed) {
-                                val event = awaitPointerEvent()
-                                val change = event.changes.first()
-                                if (change.pressed) {
-                                    currentViewport += change.position - previous
-                                    onViewportChange(currentViewport)
-                                    previous = change.position
-                                    change.consume()
-                                }
-                                pressed = event.changes.any { it.pressed }
-                            }
                         }
                     }
                 }
+                session.previewPoints.clear()
             }
         },
     ) {
@@ -587,10 +596,16 @@ private fun DrawingCanvas(
                     if (tool == CanvasTool.MARKER) 26f else 5.5f,
                 )
             }
-            session.selectedItem()?.let { drawSelection(it.bounds(), 1f / scale) }
         }
     }
 }
+
+internal fun transformViewport(
+    viewport: Offset,
+    previousCentroid: Offset,
+    currentCentroid: Offset,
+    scaleChange: Float,
+): Offset = currentCentroid - (previousCentroid - viewport) * scaleChange
 
 private fun screenToBoard(point: Offset, viewport: Offset, scale: Float) =
     BoardPoint((point.x - viewport.x) / scale, (point.y - viewport.y) / scale)
@@ -632,21 +647,6 @@ private fun DrawScope.drawStroke(points: List<BoardPoint>, color: Color, width: 
     drawPath(path, color, style = Stroke(width, cap = StrokeCap.Round, join = StrokeJoin.Round))
 }
 
-private fun DrawScope.drawSelection(bounds: ItemBounds, screenStroke: Float) {
-    val padding = 10f
-    val rect = Rect(bounds.left - padding, bounds.top - padding, bounds.right + padding, bounds.bottom + padding)
-    drawRoundRect(
-        color = Accent,
-        topLeft = rect.topLeft,
-        size = rect.size,
-        cornerRadius = androidx.compose.ui.geometry.CornerRadius(8f),
-        style = Stroke(max(2f, screenStroke * 1.5f)),
-    )
-    listOf(rect.topLeft, rect.topRight, rect.bottomLeft, rect.bottomRight).forEach {
-        drawCircle(Color.White, radius = 6f + screenStroke, center = it)
-        drawCircle(Accent, radius = 6f + screenStroke, center = it, style = Stroke(max(2f, screenStroke)))
-    }
-}
 
 @Composable
 private fun DrawingDock(
@@ -699,10 +699,14 @@ private fun DrawingDock(
 @Composable
 private fun ToolButton(tool: CanvasTool, selected: Boolean, onClick: () -> Unit) {
     val label = when (tool) {
-        CanvasTool.SELECT -> "Move"
         CanvasTool.PEN -> "Pen"
         CanvasTool.MARKER -> "Marker"
         CanvasTool.ERASER -> "Eraser"
+    }
+    val icon = when (tool) {
+        CanvasTool.PEN -> R.drawable.ic_material_draw
+        CanvasTool.MARKER -> R.drawable.ic_material_highlighter
+        CanvasTool.ERASER -> R.drawable.ic_material_eraser
     }
     Column(
         Modifier.width(66.dp).height(56.dp)
@@ -712,44 +716,24 @@ private fun ToolButton(tool: CanvasTool, selected: Boolean, onClick: () -> Unit)
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        ToolGlyph(tool, Ink)
+        Image(
+            painter = painterResource(icon),
+            contentDescription = null,
+            modifier = Modifier.size(24.dp),
+            colorFilter = ColorFilter.tint(Ink),
+        )
         AppText(label, 11.sp, FontWeight.SemiBold, color = if (selected) Ink else Muted)
     }
 }
 
-@Composable
-private fun ToolGlyph(tool: CanvasTool, color: Color) {
-    Canvas(Modifier.size(24.dp)) {
-        val iconScale = size.minDimension / 24f
-        withTransform({ scale(iconScale, iconScale, pivot = Offset.Zero) }) {
-            val stroke = 2.2f
-            when (tool) {
-                CanvasTool.SELECT -> {
-                    val path = Path().apply {
-                        moveTo(6f, 3f); lineTo(19f, 14f); lineTo(13f, 15f); lineTo(10f, 21f); close()
-                    }
-                    drawPath(path, color, style = Stroke(stroke, join = StrokeJoin.Round))
-                }
-                CanvasTool.PEN -> {
-                    drawLine(color, Offset(7f, 19f), Offset(17f, 5f), stroke * 2f, StrokeCap.Round)
-                    drawLine(color, Offset(5f, 21f), Offset(9f, 19f), stroke, StrokeCap.Round)
-                }
-                CanvasTool.MARKER -> {
-                    drawLine(color, Offset(7f, 18f), Offset(17f, 7f), stroke * 4f, StrokeCap.Square)
-                    drawLine(color, Offset(5f, 21f), Offset(12f, 21f), stroke * 2f, StrokeCap.Round)
-                }
-                CanvasTool.ERASER -> {
-                    val path = Path().apply {
-                        moveTo(5f, 16f); lineTo(13f, 6f); lineTo(20f, 12f); lineTo(13f, 20f); lineTo(8f, 20f); close()
-                    }
-                    drawPath(path, color, style = Stroke(stroke, join = StrokeJoin.Round))
-                }
-            }
-        }
-    }
-}
 
-private enum class ActionIcon { BACK, UNDO, REDO, PLUS, MINUS }
+private enum class ActionIcon(val resource: Int) {
+    BACK(R.drawable.ic_material_back),
+    UNDO(R.drawable.ic_material_undo),
+    REDO(R.drawable.ic_material_redo),
+    PLUS(R.drawable.ic_material_add),
+    MINUS(R.drawable.ic_material_remove),
+}
 
 @Composable
 private fun RoundAction(
@@ -770,35 +754,12 @@ private fun RoundAction(
             .clickable(enabled = enabled, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
-        Canvas(Modifier.size(24.dp)) {
-            val stroke = 2.2.dp.toPx()
-            when (icon) {
-                ActionIcon.BACK -> {
-                    drawLine(iconColor, Offset(size.width * 0.65f, size.height * 0.2f), Offset(size.width * 0.35f, size.height * 0.5f), stroke, StrokeCap.Round)
-                    drawLine(iconColor, Offset(size.width * 0.35f, size.height * 0.5f), Offset(size.width * 0.65f, size.height * 0.8f), stroke, StrokeCap.Round)
-                }
-                ActionIcon.PLUS -> {
-                    drawLine(iconColor, Offset(size.width * 0.2f, size.height * 0.5f), Offset(size.width * 0.8f, size.height * 0.5f), stroke, StrokeCap.Round)
-                    drawLine(iconColor, Offset(size.width * 0.5f, size.height * 0.2f), Offset(size.width * 0.5f, size.height * 0.8f), stroke, StrokeCap.Round)
-                }
-                ActionIcon.MINUS -> drawLine(iconColor, Offset(size.width * 0.2f, size.height * 0.5f), Offset(size.width * 0.8f, size.height * 0.5f), stroke, StrokeCap.Round)
-                ActionIcon.UNDO, ActionIcon.REDO -> {
-                    val direction = if (icon == ActionIcon.UNDO) -1f else 1f
-                    val path = Path().apply {
-                        moveTo(size.width * (0.5f - direction * 0.28f), size.height * 0.7f)
-                        cubicTo(
-                            size.width * (0.5f - direction * 0.2f), size.height * 0.25f,
-                            size.width * (0.5f + direction * 0.25f), size.height * 0.3f,
-                            size.width * (0.5f + direction * 0.28f), size.height * 0.58f,
-                        )
-                    }
-                    drawPath(path, iconColor, style = Stroke(stroke, cap = StrokeCap.Round))
-                    val tip = Offset(size.width * (0.5f - direction * 0.28f), size.height * 0.7f)
-                    drawLine(iconColor, tip, Offset(tip.x + direction * size.width * 0.02f, tip.y - size.height * 0.23f), stroke, StrokeCap.Round)
-                    drawLine(iconColor, tip, Offset(tip.x + direction * size.width * 0.2f, tip.y - size.height * 0.02f), stroke, StrokeCap.Round)
-                }
-            }
-        }
+        Image(
+            painter = painterResource(icon.resource),
+            contentDescription = null,
+            modifier = Modifier.size(24.dp),
+            colorFilter = ColorFilter.tint(iconColor),
+        )
     }
 }
 

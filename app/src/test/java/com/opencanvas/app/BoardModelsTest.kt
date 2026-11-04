@@ -57,18 +57,4 @@ class BoardModelsTest {
         assertNull(hitTest(items, BoardPoint(200f, 200f), tolerance = 0f))
     }
 
-    @Test
-    fun movingAStrokeTranslatesEveryPointWithoutChangingStyle() {
-        val original = BoardItem(
-            id = "stroke",
-            points = listOf(BoardPoint(1f, 2f), BoardPoint(3f, 5f)),
-            color = 0xFF445566L,
-            width = 7f,
-        )
-
-        assertEquals(
-            original.copy(points = listOf(BoardPoint(11f, -2f), BoardPoint(13f, 1f))),
-            original.moved(10f, -4f),
-        )
-    }
 }

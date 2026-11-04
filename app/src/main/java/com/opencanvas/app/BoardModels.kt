@@ -25,12 +25,9 @@ data class BoardItem(
     val opacity: Float = 1f,
 )
 
-enum class CanvasTool { SELECT, PEN, MARKER, ERASER }
+enum class CanvasTool { PEN, MARKER, ERASER }
 
-data class ItemBounds(val left: Float, val top: Float, val right: Float, val bottom: Float) {
-    fun contains(point: BoardPoint, padding: Float = 0f): Boolean =
-        point.x in (left - padding)..(right + padding) && point.y in (top - padding)..(bottom + padding)
-}
+data class ItemBounds(val left: Float, val top: Float, val right: Float, val bottom: Float)
 
 fun BoardItem.bounds(): ItemBounds {
     if (points.isEmpty()) return ItemBounds(0f, 0f, 0f, 0f)
@@ -42,8 +39,6 @@ fun BoardItem.bounds(): ItemBounds {
     )
 }
 
-fun BoardItem.moved(dx: Float, dy: Float): BoardItem =
-    copy(points = points.map { BoardPoint(it.x + dx, it.y + dy) })
 
 fun hitTest(items: List<BoardItem>, point: BoardPoint, tolerance: Float = 16f): BoardItem? =
     items.asReversed().firstOrNull { item ->
